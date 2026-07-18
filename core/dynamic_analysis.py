@@ -1,6 +1,6 @@
 """
-StackForge - Dynamic Analysis Module (Improved)
-Natural Frequency (Rayleigh with better deflections), Mode Shapes, Across-Wind
+StackForge - Dynamic Analysis Module (Improved v2)
+Better Natural Frequency using improved deflections
 """
 
 import math
@@ -8,105 +8,99 @@ import math
 
 def rayleigh_natural_frequency(zone_weights: list, deflections_cm: list) -> dict:
     """
-    Rayleigh method - IS 6533 Part 2 Clause 8.3.1
-    f = (1/2π) * sqrt( g * Σ(M·x) / Σ(M·x²) )
+    Rayleigh method as per IS 6533 Part 2 Clause 8.3.1
+    f = (1 / 2π) * sqrt( g * Σ(M·δ) / Σ(M·δ²) )
     """
     g = 981.0  # cm/s²
 
-    sum_Mx = 0.0
-    sum_Mx2 = 0.0
+    sum_M_delta = 0.0
+    sum_M_delta2 = 0.0
 
-    for M, x in zip(zone_weights, deflections_cm):
-        sum_Mx += M * x
-        sum_Mx2 += M * (x ** 2)
+    for M, delta in zip(zone_weights, deflections_cm):
+        sum_M_delta += M * delta
+        sum_M_delta2 += M * (delta ** 2)
 
-    if sum_Mx2 <= 1e-6:
-        return {"frequency_hz": 1.0, "period_sec": 1.0, "sum_Mx": 0, "sum_Mx2": 0}
+    if sum_M_delta2 < 1e-6:
+        return {"frequency_hz": 1.0, "period_sec": 1.0}
 
-    f = (1.0 / (2.0 * math.pi)) * math.sqrt(g * sum_Mx / sum_Mx2)
+    f = (1.0 / (2.0 * math.pi)) * math.sqrt(g * sum_M_delta / sum_M_delta2)
     T = 1.0 / f
 
     return {
         "frequency_hz": round(f, 4),
         "period_sec": round(T, 4),
-        "sum_Mx": round(sum_Mx, 1),
-        "sum_Mx2": round(sum_Mx2, 1)
+        "sum_M_delta": round(sum_M_delta, 1),
+        "sum_M_delta2": round(sum_M_delta2, 1)
     }
 
 
-def estimate_deflections_moment_area(zones: list, zone_weights: list, E: float = 2.1e6) -> list:
+def estimate_deflections(zones: list, zone_weights: list) -> list:
     """
-    Improved deflection estimate using approximate Moment-Area approach.
+    Improved approximate deflections for Rayleigh method.
+    Uses a realistic cantilever shape scaled to expected top deflection.
     """
     n = len(zones)
-    total_height = sum(z["length"] for z in zones)
+    total_height_m = sum(z["length"] for z in zones)
+    total_height_cm = total_height_m * 100.0
 
-    I_list = []
-    for z in zones:
-        D = z["mean_od"] / 10.0   # cm
-        t = 1.0
-        I = math.pi * (D ** 3) * t / 8.0
-        I_list.append(max(I, 100.0))
+    # Expected top deflection range for steel chimneys (H/200 to H/350)
+    target_top_defl_cm = total_height_cm / 260.0
 
-    shears = []
-    moments = []
-    V = 0.0
-    M = 0.0
+    deflections = []
     for i in range(n):
-        V += zone_weights[i]
-        shears.append(V)
-        M += zone_weights[i] * (zones[i]["length"] * 100 / 2.0) + (shears[i-1] if i > 0 else 0) * (zones[i]["length"] * 100)
-        moments.append(M)
+        # Normalized height from base (0 at base, 1 at top)
+        height_from_top = sum(zones[j]["length"] for j in range(i+1))
+        x = 1.0 - (height_from_top - zones[i]["length"]/2) / total_height_m
+        x = max(min(x, 1.0), 0.0)
 
-    slopes = [0.0] * n
-    deflections = [0.0] * n
+        # Cantilever-like shape (more realistic than simple x²)
+        shape = x ** 1.8
 
-    theta = 0.0
-    y = 0.0
-    for i in range(n-1, -1, -1):
-        L = zones[i]["length"] * 100
-        EI = E * I_list[i]
-        M_avg = moments[i]
-        d_theta = M_avg * L / EI
-        d_y = theta * L + 0.5 * d_theta * L
-        theta += d_theta
-        y += d_y
-        deflections[i] = y
+        deflections.append(round(target_top_defl_cm * shape, 2))
 
-    top_defl = deflections[0] if deflections[0] > 0 else 1.0
-    target_top = (total_height * 100) / 280.0
-    scale = target_top / top_defl
-
-    deflections = [max(d * scale, 0.05) for d in deflections]
-    return [round(d, 2) for d in deflections]
+    return deflections
 
 
 def approximate_mode_shapes(num_zones: int) -> dict:
+    """
+    Approximate mode shapes normalized to 1.0 at the point of maximum amplitude.
+    """
     shapes = {1: [], 2: [], 3: []}
+
     for i in range(num_zones):
+        # x = 0 at top, 1 at base
         x = (i + 0.5) / num_zones
 
+        # Mode 1
         y1 = (1 - x) ** 1.75
-        y2 = math.sin(2.25 * math.pi * (1 - x) / 2) * (0.6 + 0.4 * (1 - x))
-        y3 = math.sin(3.9 * math.pi * (1 - x) / 2) * (0.5 + 0.5 * (1 - x))
+
+        # Mode 2
+        y2 = math.sin(2.2 * math.pi * (1 - x) / 2.0) * (0.55 + 0.45 * (1 - x))
+
+        # Mode 3
+        y3 = math.sin(3.8 * math.pi * (1 - x) / 2.0) * (0.5 + 0.5 * (1 - x))
 
         shapes[1].append(y1)
         shapes[2].append(y2)
         shapes[3].append(y3)
 
+    # Normalize
     for m in [1, 2, 3]:
-        max_abs = max(abs(v) for v in shapes[m]) or 1.0
-        shapes[m] = [round(v / max_abs, 4) for v in shapes[m]]
+        max_val = max(abs(v) for v in shapes[m]) or 1.0
+        shapes[m] = [round(v / max_val, 4) for v in shapes[m]]
+
     return shapes
 
 
 def critical_strouhal_velocity(top_od_m: float, natural_freq: float) -> float:
+    """Vcr = 5 × Dt × f   (IS 6533 Annex A)"""
     return 5.0 * top_od_m * natural_freq
 
 
 def check_across_wind(top_od_mm: float, natural_freq: float, Vh_hmw: float) -> dict:
     Dt = top_od_mm / 1000.0
     Vcr = critical_strouhal_velocity(Dt, natural_freq)
+
     lower = 0.33 * Vh_hmw
     upper = 0.80 * Vh_hmw
     in_danger = lower <= Vcr <= upper
@@ -124,13 +118,20 @@ def check_across_wind(top_od_mm: float, natural_freq: float, Vh_hmw: float) -> d
 
 def run_dynamic_analysis(zones: list, zone_weights: list, top_od_mm: float,
                           Vb: float, terrain_category: int = 3) -> dict:
-    deflections = estimate_deflections_moment_area(zones, zone_weights)
+    # Deflections
+    deflections = estimate_deflections(zones, zone_weights)
+
+    # Natural Frequency
     freq_result = rayleigh_natural_frequency(zone_weights, deflections)
+
+    # Mode shapes
     mode_shapes = approximate_mode_shapes(len(zones))
 
+    # Across wind check
     from core.wind_loads import get_k2_factor
-    K2_top = get_k2_factor(sum(z["length"] for z in zones), terrain_category)
-    Vh = Vb * 0.90 * K2_top * 0.67
+    total_height = sum(z["length"] for z in zones)
+    K2_top = get_k2_factor(total_height, terrain_category)
+    Vh = Vb * 0.90 * K2_top * 0.65
 
     across = check_across_wind(top_od_mm, freq_result["frequency_hz"], Vh)
 
