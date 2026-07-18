@@ -1,14 +1,9 @@
 """
-StackForge - Master Calculation Engine
-Orchestrates all design modules and returns complete results
+StackForge - Master Calculation Engine (Improved)
 """
 
-from core.geometry import (
-    calculate_flare_height,
-    generate_shell_zones,
-    get_section_properties
-)
-from core.thickness import design_shell_thicknesses, iterate_thickness
+from core.geometry import calculate_flare_height, generate_shell_zones
+from core.thickness import design_shell_thicknesses
 from core.weights import calculate_zone_weights, get_cumulative_weights
 from core.wind_loads import calculate_all_wind_loads
 from core.dynamic_analysis import run_dynamic_analysis
@@ -19,176 +14,100 @@ from core.shell_stress import run_shell_stress_analysis
 
 
 def run_complete_design(inputs: dict) -> dict:
-    """
-    Master function – runs the complete chimney design.
-
-    Parameters
-    ----------
-    inputs : dict
-        Dictionary of all user inputs (from InputPanel.get_all_inputs())
-
-    Returns
-    -------
-    dict
-        Complete design results ready for display and reporting.
-    """
-
-    # ------------------------------------------------------------------
-    # 1. Basic Geometry
-    # ------------------------------------------------------------------
+    # 1. Geometry
     H = inputs["total_height"]
     top_id = inputs["top_id"]
     is_lined = inputs["is_lined"]
     bottom_od = inputs["bottom_od"]
-    top_od = top_id + 2 * 6   # approximate initial top OD (will be refined)
+    top_od = top_id + 2 * (inputs.get("int_corrosion", 3) + 3)
 
-    # Flare height
     if inputs.get("flare_height", 0) > 0.5:
         flare_height = inputs["flare_height"]
     else:
         flare_height = calculate_flare_height(H, top_id, is_lined)
 
-    # Generate zones
-    zones = generate_shell_zones(
-        total_height=H,
-        flare_height=flare_height,
-        top_od=top_od,
-        bottom_od=bottom_od,
-        preferred_zone_length=6.0
-    )
-
+    zones = generate_shell_zones(H, flare_height, top_od, bottom_od, preferred_zone_length=5.0)
     if not zones:
-        return {"error": "Could not generate shell zones. Check geometry inputs."}
+        return {"error": "Could not generate shell zones."}
 
-    # ------------------------------------------------------------------
-    # 2. Preliminary Weights (assume trial thicknesses)
-    # ------------------------------------------------------------------
-    trial_thicknesses = [10.0] * len(zones)
-    # Increase thickness towards bottom
-    for i in range(len(trial_thicknesses)):
-        trial_thicknesses[i] = 8.0 + i * 1.5
-
+    # 2. Trial weights
+    trial_thk = [8.0 + i * 1.2 for i in range(len(zones))]
     platform_elevs = []
-    if inputs.get("num_platforms", 0) > 0:
-        # Simple distribution of platforms
-        n_plat = inputs["num_platforms"]
-        for i in range(n_plat):
-            elev = H * (0.9 - i * 0.35)
-            if elev > 2:
-                platform_elevs.append(elev)
+    n_plat = inputs.get("num_platforms", 0)
+    for i in range(n_plat):
+        elev = H * (0.92 - i * 0.38)
+        if elev > 3:
+            platform_elevs.append(elev)
 
     weight_data = calculate_zone_weights(
-        zones=zones,
-        thicknesses=trial_thicknesses,
-        platform_elevations=platform_elevs,
+        zones, trial_thk, platform_elevs,
         platform_width_mm=inputs.get("platform_width", 900),
         provide_strakes=inputs.get("strakes", False)
     )
-
     zone_weights = [z["zone_total"] for z in weight_data["zones"]]
     cumulative_weights = get_cumulative_weights(weight_data["zones"])
 
-    # ------------------------------------------------------------------
-    # 3. Dynamic Analysis (Frequency + Mode Shapes)
-    # ------------------------------------------------------------------
+    # 3. Dynamic Analysis
+    terrain_cat = 2 if "2" in str(inputs.get("terrain", "3")) else 3
     dynamic = run_dynamic_analysis(
-        zones=zones,
-        zone_weights=zone_weights,
-        top_od_mm=top_od,
+        zones, zone_weights, top_od,
         Vb=inputs["wind_speed"],
-        terrain_category=3
+        terrain_category=terrain_cat
     )
-
     nat_freq = dynamic["natural_frequency"]["frequency_hz"]
     mode_shapes = dynamic["mode_shapes"]
 
-    # ------------------------------------------------------------------
-    # 4. Wind Loads
-    # ------------------------------------------------------------------
+    # 4. Wind Loads (now returns proper moments)
     wind = calculate_all_wind_loads(
-        zones=zones,
-        zone_weights=zone_weights,
+        zones, zone_weights,
         Vb=inputs["wind_speed"],
         natural_freq=nat_freq,
         K1=0.90,
-        terrain_category=3
+        terrain_category=terrain_cat
     )
+    governing_moments = wind.get("moments", [10000] * len(zones))
 
-    # Governing moments (simplified – use gust loads for now)
-    # In a full version we would integrate loads to get proper BM
-    # Here we create approximate moments increasing towards base
-    n = len(zones)
-    approx_moments = []
-    total_shear = sum(w["gust"] for w in wind["zones"])
-    for i in range(n):
-        # Rough moment accumulation
-        lever = sum(zones[j]["length"] for j in range(i, n)) * 0.55
-        M = total_shear * lever * (i + 1) / n
-        approx_moments.append(round(M, 1))
-
-    # ------------------------------------------------------------------
     # 5. Earthquake
-    # ------------------------------------------------------------------
     earthquake = run_earthquake_analysis(
-        zones=zones,
-        zone_weights=zone_weights,
-        mode_shapes=mode_shapes,
+        zones, zone_weights, mode_shapes,
         natural_period=dynamic["natural_frequency"]["period_sec"],
-        seismic_zone=inputs.get("seismic_zone", "Zone 4"),
+        seismic_zone=inputs.get("seismic_zone", "Zone 3"),
         importance=inputs.get("importance", 1.5)
     )
 
-    # ------------------------------------------------------------------
-    # 6. Shell Thickness Design (iterative)
-    # ------------------------------------------------------------------
+    # 6. Thickness design using proper moments
     thickness_results = design_shell_thicknesses(
-        zones=zones,
-        axial_forces=cumulative_weights,
-        moments=approx_moments,
+        zones, cumulative_weights, governing_moments,
         temperature=inputs.get("temperature", 250),
         corrosion_mm=inputs.get("int_corrosion", 3.0)
     )
-
     final_thicknesses = [t["practical_thickness"] for t in thickness_results]
 
-    # Re-calculate weights with final thicknesses
+    # Recalculate weights with final thicknesses
     weight_data = calculate_zone_weights(
-        zones=zones,
-        thicknesses=final_thicknesses,
-        platform_elevations=platform_elevs,
+        zones, final_thicknesses, platform_elevs,
         platform_width_mm=inputs.get("platform_width", 900),
         provide_strakes=inputs.get("strakes", False)
     )
     zone_weights = [z["zone_total"] for z in weight_data["zones"]]
     cumulative_weights = get_cumulative_weights(weight_data["zones"])
 
-    # ------------------------------------------------------------------
-    # 7. Shell Stress Check
-    # ------------------------------------------------------------------
+    # 7. Shell Stress
     stress_results = run_shell_stress_analysis(
-        zones=zones,
-        thicknesses=final_thicknesses,
-        axial_forces=cumulative_weights,
-        moments=approx_moments,
+        zones, final_thicknesses, cumulative_weights, governing_moments,
         temperature=inputs.get("temperature", 250),
         corrosion_mm=inputs.get("int_corrosion", 3.0)
     )
 
-    # ------------------------------------------------------------------
-    # 8. Flange Design
-    # ------------------------------------------------------------------
+    # 8. Flanges
     flanges = design_all_flanges(
-        zones=zones,
-        moments=approx_moments,
-        cumulative_weights=cumulative_weights,
+        zones, governing_moments, cumulative_weights,
         min_bolt_size=inputs.get("min_bolt", "M24"),
         min_flange_thk=inputs.get("min_flange_thk", 12.0)
     )
 
-    # ------------------------------------------------------------------
-    # 9. Base Chair Design
-    # ------------------------------------------------------------------
-    base_moment = approx_moments[-1] if approx_moments else 50000
+    # 9. Base Chair
+    base_moment = governing_moments[-1] if governing_moments else 50000
     base_shear = sum(w["gust"] for w in wind["zones"])
     total_wt = weight_data["summary"]["grand_total"]
 
@@ -200,9 +119,6 @@ def run_complete_design(inputs: dict) -> dict:
         base_plate_width_mm=inputs.get("base_plate_width", 300)
     )
 
-    # ------------------------------------------------------------------
-    # 10. Compile Final Results
-    # ------------------------------------------------------------------
     return {
         "inputs": inputs,
         "geometry": {
